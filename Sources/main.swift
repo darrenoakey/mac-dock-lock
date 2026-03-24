@@ -11,15 +11,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var accessibilityTimer: Timer?
+    private var backupTimer: Timer?
     private var isEnabled = true
-    private var hasShownMisplacedAlert = false
+    private var isRelocating = false
+    private var relocationAttempts = 0
+    private let syntheticMarker: Int64 = 0x444F434B // "DOCK"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
         registerNotifications()
         ensureAccessibilityAndStartTap()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.updateDockStatus()
+        startBackupTimer()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.checkAndCorrectDock()
         }
     }
 
@@ -37,7 +41,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 self?.accessibilityTimer = nil
                 self?.startEventTap()
-                self?.updateDockStatus()
+                self?.checkAndCorrectDock()
             }
         }
     }
@@ -106,10 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateIcon()
         if isEnabled {
             startEventTap()
+            startBackupTimer()
+            checkAndCorrectDock()
         } else {
             stopEventTap()
+            backupTimer?.invalidate()
+            backupTimer = nil
         }
-        updateDockStatus()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
@@ -140,12 +147,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - CGEventTap (Prevention)
     //
-    // Blocks mouseMoved events when the cursor enters a 10px trigger zone on
-    // the Dock edge of any non-main display. This prevents macOS from migrating
-    // the Dock — the cursor simply stops at the zone boundary, like hitting a
-    // screen edge. No cursor warping or manipulation.
-    //
-    // Requires Accessibility permission (System Settings > Privacy > Accessibility).
+    // Blocks mouseMoved events in the Dock trigger zone of non-main displays.
+    // During relocation, blocks ALL real events but passes synthetic ones
+    // (identified by syntheticMarker in eventSourceUserData).
 
     private func startEventTap() {
         guard isEnabled, eventTap == nil, AXIsProcessTrusted() else { return }
@@ -187,22 +191,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleMouseEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        // Re-enable tap if macOS disabled it due to timeout or user input
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
         guard isEnabled else { return Unmanaged.passUnretained(event) }
 
+        // During relocation: pass our synthetic events, block real ones
+        if isRelocating {
+            if event.getIntegerValueField(.eventSourceUserData) == syntheticMarker {
+                return Unmanaged.passUnretained(event)
+            }
+            return nil
+        }
+
+        // Normal: block events in trigger zones on non-main displays
         if isInDockTriggerZone(event.location) {
-            return nil // Drop event — cursor stops at zone boundary
+            return nil
         }
         return Unmanaged.passUnretained(event)
     }
 
-    /// Returns true if the point is in the Dock trigger zone of any non-main display.
-    /// The trigger zone is a 10px strip on the Dock edge (bottom/left/right) where
-    /// hovering causes macOS to migrate the Dock to that display.
     private func isInDockTriggerZone(_ point: CGPoint) -> Bool {
         let mainID = CGMainDisplayID()
         let orientation = dockOrientation()
@@ -231,54 +240,185 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    // MARK: - Notifications (Status Updates)
+    // MARK: - Dock Correction (Synthetic HID Events)
+    //
+    // Uses DockAnchor's proven technique: hide cursor, send synthetic mouse
+    // events via .cghidEventTap with .hidSystemState source to simulate cursor
+    // presence at the main display's Dock edge. Events are marked with
+    // syntheticMarker so the event tap lets them through while blocking real
+    // mouse input. The cursor is hidden during the ~0.7s operation and restored
+    // to its original position — invisible to the user.
+
+    private func relocateDock() {
+        guard !isRelocating, AXIsProcessTrusted() else { return }
+        guard relocationAttempts < 5 else {
+            relocationAttempts = 0
+            return
+        }
+        isRelocating = true
+        relocationAttempts += 1
+
+        let savedPos = CGEvent(source: nil)?.location ?? .zero
+        NSCursor.hide()
+
+        DispatchQueue.global(qos: .userInteractive).async { [self] in
+            let mainBounds = CGDisplayBounds(CGMainDisplayID())
+            let orientation = dockOrientation()
+
+            // Target: Dock edge of main display. Approach: 50px before the edge.
+            let target: CGPoint
+            let approach: CGPoint
+            switch orientation {
+            case "left":
+                target = CGPoint(x: mainBounds.minX, y: mainBounds.midY)
+                approach = CGPoint(x: mainBounds.minX + 50, y: mainBounds.midY)
+            case "right":
+                target = CGPoint(x: mainBounds.maxX - 1, y: mainBounds.midY)
+                approach = CGPoint(x: mainBounds.maxX - 51, y: mainBounds.midY)
+            default:
+                target = CGPoint(x: mainBounds.midX, y: mainBounds.maxY - 1)
+                approach = CGPoint(x: mainBounds.midX, y: mainBounds.maxY - 51)
+            }
+
+            let source = CGEventSource(stateID: .hidSystemState)
+
+            // Move to approach point
+            CGWarpMouseCursorPosition(approach)
+            usleep(30_000)
+
+            // Progressive move from approach to target (8 steps)
+            for i in 0..<8 {
+                let t = CGFloat(i + 1) / 8.0
+                let pos = CGPoint(
+                    x: approach.x + (target.x - approach.x) * t,
+                    y: approach.y + (target.y - approach.y) * t
+                )
+                CGWarpMouseCursorPosition(pos)
+                if let ev = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                                    mouseCursorPosition: pos, mouseButton: .left) {
+                    ev.setIntegerValueField(.eventSourceUserData, value: self.syntheticMarker)
+                    ev.post(tap: .cghidEventTap)
+                }
+                usleep(30_000)
+            }
+
+            // Hold at target edge (10 events to trigger Dock migration)
+            for _ in 0..<10 {
+                CGWarpMouseCursorPosition(target)
+                if let ev = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                                    mouseCursorPosition: target, mouseButton: .left) {
+                    ev.setIntegerValueField(.eventSourceUserData, value: self.syntheticMarker)
+                    ev.post(tap: .cghidEventTap)
+                }
+                usleep(80_000)
+            }
+
+            // Restore cursor on main thread
+            DispatchQueue.main.async { [self] in
+                CGWarpMouseCursorPosition(savedPos)
+                NSCursor.unhide()
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    self?.isRelocating = false
+                    self?.checkAndCorrectDock()
+                }
+            }
+        }
+    }
+
+    // MARK: - Check & Correct
+
+    private func checkAndCorrectDock() {
+        guard isEnabled, !isRelocating else { return }
+        guard NSScreen.screens.count > 1 else {
+            updateStatusText()
+            return
+        }
+
+        guard let dockScreen = detectDockScreen() else {
+            updateStatusText()
+            return
+        }
+
+        let onMain = displayID(for: dockScreen) == CGMainDisplayID()
+        if onMain {
+            relocationAttempts = 0
+            updateStatusText()
+        } else {
+            updateStatusText()
+            relocateDock()
+        }
+    }
+
+    private func updateStatusText() {
+        if !AXIsProcessTrusted() {
+            statusMenuItem.title = "Needs Accessibility permission"
+            return
+        }
+        guard NSScreen.screens.count > 1 else {
+            statusMenuItem.title = "Single display"
+            return
+        }
+        guard let dockScreen = detectDockScreen() else {
+            statusMenuItem.title = "Dock position: unknown"
+            return
+        }
+        let onMain = displayID(for: dockScreen) == CGMainDisplayID()
+        statusMenuItem.title = onMain ? "Dock: locked to main display" : "Dock: on \(dockScreen.localizedName)"
+    }
+
+    // MARK: - Backup Timer (catches edge cases notifications miss)
+
+    private func startBackupTimer() {
+        backupTimer?.invalidate()
+        backupTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.checkAndCorrectDock()
+        }
+    }
+
+    // MARK: - Notifications
 
     private func registerNotifications() {
-        // Screen geometry changed (fires when Dock migrates between displays)
         NotificationCenter.default.addObserver(
             self, selector: #selector(onScreenChange),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        // Dock preferences changed (orientation, autohide, etc.)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(onDockChange),
             name: NSNotification.Name("com.apple.dock.prefchanged"), object: nil)
 
-        // Active display changed (undocumented; used by yabai & Hammerspoon)
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(onActiveDisplayChange),
             name: NSNotification.Name("NSWorkspaceActiveDisplayDidChangeNotification"), object: nil)
 
-        // Dock process restarted
         NotificationCenter.default.addObserver(
             self, selector: #selector(onDockRestart),
             name: NSNotification.Name("NSApplicationDockDidRestartNotification"), object: nil)
 
-        // System woke from sleep
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(onWake),
             name: NSWorkspace.didWakeNotification, object: nil)
     }
 
-    @objc private func onScreenChange(_ n: Notification) { updateDockStatus() }
-    @objc private func onDockChange(_ n: Notification) { updateDockStatus() }
+    @objc private func onScreenChange(_ n: Notification) { checkAndCorrectDock() }
+    @objc private func onDockChange(_ n: Notification) { checkAndCorrectDock() }
     @objc private func onActiveDisplayChange(_ n: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.updateDockStatus()
+            self?.checkAndCorrectDock()
         }
     }
     @objc private func onDockRestart(_ n: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.updateDockStatus()
+            self?.checkAndCorrectDock()
         }
     }
     @objc private func onWake(_ n: Notification) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.updateDockStatus()
+            self?.checkAndCorrectDock()
         }
     }
 
-    // MARK: - Detection & Status
+    // MARK: - Detection
 
     private func dockOrientation() -> String {
         UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation") ?? "bottom"
@@ -288,9 +428,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
     }
 
-    /// Finds which screen currently hosts the Dock by comparing visibleFrame gaps.
-    /// The screen with the Dock has a larger inset on the Dock's edge.
-    /// No special permissions required — uses only public NSScreen API.
     private func detectDockScreen() -> NSScreen? {
         let screens = NSScreen.screens
         guard screens.count > 1 else { return screens.first }
@@ -315,45 +452,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return maxGap > 2 ? best : nil
     }
-
-    private func updateDockStatus() {
-        if !AXIsProcessTrusted() {
-            statusMenuItem.title = "Needs Accessibility permission"
-            return
-        }
-        guard NSScreen.screens.count > 1 else {
-            statusMenuItem.title = "Single display"
-            return
-        }
-        guard let dockScreen = detectDockScreen() else {
-            statusMenuItem.title = "Dock position: unknown"
-            return
-        }
-
-        let onMain = displayID(for: dockScreen) == CGMainDisplayID()
-        if onMain {
-            statusMenuItem.title = "Dock: locked to main display"
-            hasShownMisplacedAlert = false
-        } else {
-            statusMenuItem.title = "Dock: on \(dockScreen.localizedName)"
-            if !hasShownMisplacedAlert {
-                hasShownMisplacedAlert = true
-                let alert = NSAlert()
-                alert.messageText = "Dock is on \(dockScreen.localizedName)"
-                alert.informativeText = "Move your cursor to the bottom edge of the main display to bring the Dock back. DockLock will prevent it from moving away again."
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-            }
-        }
-    }
 }
 
 // MARK: - NSMenuDelegate
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        updateDockStatus()
+        updateStatusText()
     }
 }
 
