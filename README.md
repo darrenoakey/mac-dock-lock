@@ -94,4 +94,4 @@ Then remove it from **Login Items** in System Settings if you had enabled it the
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev/license) - free to use and modify, but no commercial use without permission.
